@@ -1775,6 +1775,23 @@ button:active {
   overflow-wrap: anywhere;
 }
 
+/* Draft-conflict previews clamp so every resolution button stays on screen no
+   matter how long either text runs; each preview scrolls on its own instead of
+   pushing the actions below the fold. */
+.draft-preview {
+  max-height: 22vh;
+  margin-top: 4px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+.draft-preview p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .pair-divider {
   height: 1px;
   margin: 16px 0;

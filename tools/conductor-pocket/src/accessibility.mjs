@@ -71,7 +71,8 @@ export function parseResult(stdout) {
 }
 
 export function mapAutomationError(error) {
-  const details = `${error?.stderr || ''}\n${error?.message || ''}`.toLowerCase();
+  const rawDetail = `${error?.stderr || ''}\n${error?.message || ''}`.trim();
+  const details = rawDetail.toLowerCase();
   if (
     details.includes('not authorized to send apple events') ||
     details.includes('not allowed assistive access') ||
@@ -87,14 +88,79 @@ export function mapAutomationError(error) {
   if (error?.killed || error?.signal === 'SIGTERM') {
     return { ok: false, code: 'automation_timeout' };
   }
-  return { ok: false, code: 'automation_failed' };
+  // The helpers throw typed pocket codes (send_unavailable,
+  // user_input_active, ...) whose text survives into osascript's stderr even
+  // when the run dies before the AppleScript can map them. Recover the code
+  // rather than collapsing every distinct failure into automation_failed,
+  // which is undiagnosable from logs and always treated as maybe-sent. Only
+  // codes from the proven safe-to-retry set are recovered here so this can
+  // never loosen delivery semantics for an unrecognized failure.
+  for (const code of safeToRetryCodes) {
+    if (details.includes(code)) {
+      return {
+        ok: false,
+        code,
+        safeToRetry: true,
+        detail: rawDetail.slice(0, 2000),
+      };
+    }
+  }
+  // Unrecognized: keep automation_failed's cautious semantics, but carry the
+  // underlying text so the failure is diagnosable from the audit log instead
+  // of being discarded here.
+  return {
+    ok: false,
+    code: 'automation_failed',
+    detail: rawDetail.slice(0, 2000),
+  };
 }
 
 export class AccessibilityTransport {
   #queue = Promise.resolve();
+  #busy = 0;
+  #currentChild = null;
 
   doctor() {
     return this.#run({ operation: 'doctor' });
+  }
+
+  // True while an osascript run is in flight. Shutdown uses this pair to
+  // avoid the worst outcome of a dying relay: the parent exiting while its
+  // osascript child keeps typing into Conductor with no relay left to record
+  // the result.
+  get busy() {
+    return this.#busy > 0;
+  }
+
+  // Wait for the in-flight operation (the queue is serialized, so there is at
+  // most one) to settle, up to budgetMs. Resolves true when the transport is
+  // idle, false when the budget expired first.
+  drain(budgetMs) {
+    if (this.#busy === 0) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(this.#busy === 0), budgetMs);
+      timer.unref?.();
+      const settle = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      this.#queue.then(settle, settle);
+    });
+  }
+
+  // Last resort for a forced exit: without this, the orphaned child survives
+  // the parent and finishes the send with nobody left to observe it.
+  killCurrentAutomation() {
+    const child = this.#currentChild;
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      return false;
+    }
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      return false;
+    }
+    return true;
   }
 
   send({
@@ -192,8 +258,9 @@ export class AccessibilityTransport {
     timeoutMs = 45_000,
   }) {
     const attemptStartedAt = Date.now();
+    this.#busy += 1;
     try {
-      const { stdout } = await execFileAsync('/usr/bin/osascript', [scriptPath], {
+      const pending = execFileAsync('/usr/bin/osascript', [scriptPath], {
         encoding: 'utf8',
         timeout: timeoutMs,
         maxBuffer: 64 * 1024,
@@ -224,9 +291,14 @@ export class AccessibilityTransport {
           POCKET_EXPECTED_INPUT_COUNTERS: expectedInputCounters,
         },
       });
+      this.#currentChild = pending.child;
+      const { stdout } = await pending;
       return parseResult(stdout);
     } catch (error) {
       return mapAutomationError(error);
+    } finally {
+      this.#busy -= 1;
+      this.#currentChild = null;
     }
   }
 }

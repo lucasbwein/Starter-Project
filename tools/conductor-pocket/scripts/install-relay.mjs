@@ -200,10 +200,18 @@ async function install() {
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
+  <!-- Unconditional: with SuccessfulExit=false, a clean SIGTERM (exit 0)
+       left the relay permanently down until a manual kickstart, and the
+       phone cannot even report why. Deliberate stops go through launchctl
+       bootout, which unloads the job entirely, so this never fights an
+       intentional shutdown. -->
+  <true/>
+  <key>ExitTimeOut</key>
+  <!-- Above the relay's own 55s force-exit deadline: a send's automation can
+       legitimately run ~50s, and launchd's default 20s SIGKILL would preempt
+       the graceful drain that keeps a dying relay from orphaning an
+       osascript child mid-type. -->
+  <integer>60</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>

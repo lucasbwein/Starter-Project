@@ -3,7 +3,7 @@ import os from 'node:os';
 
 export const APP_NAME = 'Conductor Pocket';
 export const APP_VERSION = '0.2.0';
-export const SHELL_REVISION = '0.2.0-read-20260809';
+export const SHELL_REVISION = '0.2.0-lw-20260809-205727';
 export const DEFAULT_PORT = 4317;
 export const LOOPBACK_HOST = '127.0.0.1';
 export const MAX_MESSAGE_BYTES = 16 * 1024;
@@ -27,8 +27,8 @@ export const DEFAULT_DB_PATH = path.join(
 export const CONDUCTOR_APP_PATH = '/Applications/Conductor.app';
 export const PAIRING_TTL_MS = 15 * 60 * 1000;
 export const PAIR_SESSION_TTL_MS = 5 * 60 * 1000;
-export const UNLOCK_TTL_MS = 60 * 60 * 1000;
-export const UNLOCK_IDLE_TTL_MS = 5 * 60 * 1000;
+export const UNLOCK_TTL_MS = 48 * 60 * 60 * 1000;
+export const UNLOCK_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
 export const DEVICE_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 export const TRUSTED_DEVICE_TTL_MS = 29 * 24 * 60 * 60 * 1000;
 export const SESSION_ROTATION_GRACE_MS = 5 * 60 * 1000;

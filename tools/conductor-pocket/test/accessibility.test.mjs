@@ -241,8 +241,31 @@ test('a denied Accessibility permission is provably pre-send while unknown autom
   );
   assert.deepEqual(
     mapAutomationError({ message: 'Unexpected automation failure' }),
-    { ok: false, code: 'automation_failed' },
+    {
+      ok: false,
+      code: 'automation_failed',
+      detail: 'Unexpected automation failure',
+    },
   );
+});
+
+test('a typed pocket code in osascript stderr survives instead of collapsing to automation_failed', () => {
+  const mapped = mapAutomationError({
+    stderr:
+      'conductor-input.js: execution error: Error: send_unavailable (-2700)',
+  });
+  assert.equal(mapped.code, 'send_unavailable');
+  assert.equal(mapped.safeToRetry, true);
+  assert.ok(mapped.detail.includes('send_unavailable (-2700)'));
+});
+
+test('an unrecognized automation failure keeps its underlying text as detail', () => {
+  const mapped = mapAutomationError({
+    stderr: 'execution error: Error: route_lookup exploded at depth 3 (-1719)',
+  });
+  assert.equal(mapped.code, 'automation_failed');
+  assert.equal(mapped.safeToRetry, undefined);
+  assert.ok(mapped.detail.includes('exploded at depth 3'));
 });
 
 test('message submission waits for and presses Conductor’s unique enabled Send control', async () => {

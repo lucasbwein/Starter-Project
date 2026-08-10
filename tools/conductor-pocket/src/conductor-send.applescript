@@ -275,6 +275,13 @@ on commitAndPressMessage(textArea, inputScriptPath, conductorPid, workspaceConta
 	on error errorText
 		if errorText contains "draft_conflict" then return "draft_conflict"
 		if errorText contains "session_locked" then return "session_locked"
+		-- The helper throws typed codes; passing them through names exactly
+		-- which AX assumption broke instead of collapsing every distinct
+		-- failure into automation_failed. The list mirrors the codes the
+		-- helper actually throws; anything unrecognized still falls through.
+		repeat with knownCode in {"send_unavailable", "user_input_active", "route_changed", "composer_focus_changed", "draft_changed", "composer_update_failed", "invalid_encoding", "unicode_roundtrip_failed", "target_not_active"}
+			if errorText contains knownCode then return "code:" & knownCode
+		end repeat
 		return "automation_failed"
 	end try
 	if helperResult starts with "pressed:" then return helperResult
@@ -457,6 +464,8 @@ else if commitResult starts with "retryable:" then
 	return "{\"ok\":false,\"code\":\"composer_changed_pre_send\",\"retryCertificate\":\"" & retryCertificate & "\"}"
 else if commitResult is "session_locked" then
 	return "{\"ok\":false,\"code\":\"session_locked\"}"
+else if commitResult starts with "code:" then
+	return "{\"ok\":false,\"code\":\"" & (text 6 thru -1 of commitResult) & "\"}"
 else
 	return "{\"ok\":false,\"code\":\"automation_failed\"}"
 end if

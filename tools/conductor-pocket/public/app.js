@@ -1,13 +1,14 @@
 import {
   discardTerminalUnconfirmedDeliveries,
   reconcileDeliveryReceipts,
-} from './delivery-receipts.js?v=0.2.0-read-20260809';
+} from './delivery-receipts.js?v=0.2.0-lw-20260809-205727';
 import {
   appUpdateReloadIsSafe,
   createAppUpdateCoordinator,
   createServiceWorkerRegistrationGetter,
-} from './app-update.js?v=0.2.0-read-20260809';
-import { fetchJson } from './http.js?v=0.2.0-read-20260809';
+} from './app-update.js?v=0.2.0-lw-20260809-205727';
+import { createDraftConflictFlow } from './draft-conflict.js?v=0.2.0-lw-20260809-205727';
+import { fetchJson } from './http.js?v=0.2.0-lw-20260809-205727';
 import {
   attachmentMessageByteLength,
   imageErrorCopy,
@@ -17,15 +18,15 @@ import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   MAX_ATTACHMENT_MESSAGE_BYTES,
   prepareImageForUpload,
-} from './image-attachments.js?v=0.2.0-read-20260809';
+} from './image-attachments.js?v=0.2.0-lw-20260809-205727';
 import {
   createLiveRefreshCoordinator,
   createSessionMessageRequestCoordinator,
-} from './live-refresh.js?v=0.2.0-read-20260809';
+} from './live-refresh.js?v=0.2.0-lw-20260809-205727';
 import {
   renderRichText,
   richTextProfile,
-} from './rich-text.js?v=0.2.0-read-20260809';
+} from './rich-text.js?v=0.2.0-lw-20260809-205727';
 import {
   READ_DWELL_MS,
   advanceReadProgress,
@@ -36,25 +37,37 @@ import {
   normalizeUnreadHeads,
   readableResponseRange,
   readReceiptSnapshot,
-} from './read-state.js?v=0.2.0-read-20260809';
+} from './read-state.js?v=0.2.0-lw-20260809-205727';
 import {
   activityLabel,
   buildFocusedTranscript,
   hasCurrentTerminalAgentError,
-} from './transcript-focus.js?v=0.2.0-read-20260809';
+} from './transcript-focus.js?v=0.2.0-lw-20260809-205727';
 import {
   isRecentChatsSwipe,
-} from './swipe-navigation.js?v=0.2.0-read-20260809';
+} from './swipe-navigation.js?v=0.2.0-lw-20260809-205727';
 
 const app = document.querySelector('#app');
 const overlayRoot = document.querySelector('#overlay-root');
 const announcer = document.querySelector('#announcer');
-const AWAY_LOCK_MS = 5 * 60 * 1000;
+const AWAY_LOCK_MS = 24 * 60 * 60 * 1000;
 const ACTIVITY_HEARTBEAT_MS = 60 * 1000;
 const RESUME_REQUEST_MS = 6 * 1000;
 const LIVE_REFRESH_DEBOUNCE_MS = 100;
 const METADATA_REFRESH_DEBOUNCE_MS = 800;
 const LIVE_REFRESH_REQUEST_MS = 6 * 1000;
+// Spacing between attempts to rebuild a dead event stream. Long enough that a
+// relay that is genuinely down is not hammered once per second, short enough
+// that a dropped stream recovers before it is worth reaching for the app
+// switcher.
+const STREAM_REVIVE_MS = 15 * 1000;
+// Backstop refresh while the app is on screen. The stream revive above only
+// triggers once the connection is detectably dead; a stream that stays open but
+// silently stops delivering change events looks perfectly healthy, and finished
+// output then sits invisible until the app is backgrounded and foregrounded.
+// This bounds that staleness without replacing the stream, which still delivers
+// the common case in about two seconds.
+const TRANSCRIPT_BACKSTOP_MS = 8 * 1000;
 const APP_UPDATE_CHECK_INTERVAL_MS = 30 * 1000;
 const HIDDEN_AT_KEY = 'cp:hidden-at:v1';
 const CLIENT_VERSION = '0.2.0';
@@ -67,8 +80,14 @@ const READ_RECEIPTS_KEY = 'cp:read-receipts:v1';
 const READ_RECEIPTS_CHANNEL = 'conductor-pocket-read-receipts-v1';
 const DELIVERY_RECOVERY_MS = 27_000;
 const DELIVERY_STATUS_REQUEST_MS = 2_500;
+// Bound on the send POST itself, sized above the relay's own worst case (a 45s
+// automation retry budget plus 5s send confirmation). A request that outlives
+// this is indistinguishable from a dead relay, and without a bound the bubble
+// sits at "Delivering" forever with no on-screen escape; the abort drops into
+// the same ambiguous-delivery recovery (checkDelivery) as any network failure.
+const SEND_REQUEST_TIMEOUT_MS = 60_000;
 const TAILSCALE_SESSION_MODE = 'tailscale-session';
-const CLIENT_SHELL_REVISION = '0.2.0-read-20260809';
+const CLIENT_SHELL_REVISION = '0.2.0-lw-20260809-205727';
 const MAX_CONCURRENT_IMAGE_UPLOADS = 2;
 const IMAGE_UPLOAD_TIMEOUT_MS = 45_000;
 
@@ -97,6 +116,7 @@ const state = {
   optimistic: [],
   attachmentsBySession: loadAttachmentDrafts(),
   attachmentSendIntents: new Set(),
+  sendInFlight: new Set(),
   searchQuery: '',
   shell: null,
   hiddenAt: null,
@@ -3777,6 +3797,15 @@ async function sendCurrentMessage() {
     renderComposerState();
     return;
   }
+  // Synchronous re-entrancy gate for the window between here and the field
+  // clearing after the durable persist below. A second tap or an
+  // auto-repeating Enter landing in that window would otherwise re-read the
+  // still-populated field and send the same text twice under two different
+  // idempotency keys, which the server cannot dedupe. Released after the
+  // field clears (a later tap then reads an empty field), never held through
+  // delivery, so composing the next message is not blocked.
+  if (state.sendInFlight.has(sessionId)) return;
+  state.sendInFlight.add(sessionId);
   const idempotencyKey = randomIdempotencyKey();
   const optimistic = {
     id: `optimistic:${randomIdempotencyKey()}`,
@@ -3797,6 +3826,7 @@ async function sendCurrentMessage() {
     state.optimistic = state.optimistic.filter(
       (item) => item !== optimistic,
     );
+    state.sendInFlight.delete(sessionId);
     announce('Message stayed in your draft because secure delivery storage was unavailable');
     return;
   }
@@ -3807,6 +3837,7 @@ async function sendCurrentMessage() {
   state.shell?.composer.resize();
   renderComposerAttachments();
   renderTranscript();
+  state.sendInFlight.delete(sessionId);
   await deliverOptimistic(optimistic, { deliveryIdentityPersisted: true });
 }
 
@@ -3927,28 +3958,39 @@ async function deliverOptimistic(
     }
   }
   try {
-    const result = await fetch(
-      `/api/sessions/${encodeURIComponent(optimistic.sessionId)}/messages`,
-      {
-        method: 'POST',
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'X-CSRF-Token': state.csrfToken,
-          'Idempotency-Key': deliveryKey,
-        },
-        body: JSON.stringify({
-          message: optimistic.text,
-          attachments: (optimistic.attachments || []).map(
-            (attachment) => attachment.id,
-          ),
-          replaceDraft,
-          expectedMacDraft: replaceDraft ? expectedMacDraft : undefined,
-        }),
-      },
+    const sendAbort = new AbortController();
+    const sendTimeout = setTimeout(
+      () => sendAbort.abort(),
+      SEND_REQUEST_TIMEOUT_MS,
     );
+    let result;
+    try {
+      result = await fetch(
+        `/api/sessions/${encodeURIComponent(optimistic.sessionId)}/messages`,
+        {
+          method: 'POST',
+          credentials: 'same-origin',
+          cache: 'no-store',
+          signal: sendAbort.signal,
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': state.csrfToken,
+            'Idempotency-Key': deliveryKey,
+          },
+          body: JSON.stringify({
+            message: optimistic.text,
+            attachments: (optimistic.attachments || []).map(
+              (attachment) => attachment.id,
+            ),
+            replaceDraft,
+            expectedMacDraft: replaceDraft ? expectedMacDraft : undefined,
+          }),
+        },
+      );
+    } finally {
+      clearTimeout(sendTimeout);
+    }
     const payload = await result.json().catch(() => ({}));
     if (!result.ok) {
       const error = new Error(payload.error?.code || `http_${result.status}`);
@@ -3985,7 +4027,16 @@ async function deliverOptimistic(
       optimistic.macDraft = error.draft;
       if (replaceDraft) optimistic.replaceIdempotencyKey = null;
       optimistic.replaceDraft = false;
-      openDraftConflict(optimistic);
+      if (optimistic.origin === 'macDraft') {
+        // This entry's text belongs to the Mac composer, not the phone. The
+        // conflict sheet would label it "from this phone" and offer to
+        // overwrite the phone composer with it, so a re-conflict (the Mac
+        // draft changed between reading and sending) settles as a plain
+        // retryable failure instead.
+        announce('The Mac draft changed before it could send. Nothing was replaced.');
+      } else {
+        openDraftConflict(optimistic);
+      }
     } else if (error.status === 401 || error.status === 423) {
       optimistic.delivery = 'failed';
       optimistic.retrySafe = false;
@@ -4143,7 +4194,79 @@ function retryMessage(message) {
   deliverOptimistic(message, { replaceDraft: message.replaceDraft === true });
 }
 
+const draftConflictFlow = createDraftConflictFlow({
+  deliver: (optimistic, options) => deliverOptimistic(optimistic, options),
+  makeOptimistic: (sessionId, text) => {
+    const idempotencyKey = randomIdempotencyKey();
+    return {
+      id: `optimistic:${randomIdempotencyKey()}`,
+      idempotencyKey,
+      activeDeliveryKey: idempotencyKey,
+      kind: 'optimistic',
+      sessionId,
+      text,
+      attachments: [],
+      draftAttachmentItems: null,
+      delivery: 'delivering',
+      createdAt: new Date().toISOString(),
+    };
+  },
+  insertBefore: (entry, reference) => {
+    const at = state.optimistic.indexOf(reference);
+    state.optimistic.splice(at === -1 ? state.optimistic.length : at, 0, entry);
+  },
+  remove: (entry) => {
+    state.optimistic = state.optimistic.filter((item) => item !== entry);
+  },
+  // Merged, never overwritten: a conflict can come back tens of seconds
+  // after the send, and the user may have typed something new in the phone
+  // composer meanwhile. Same combined-draft shape restoreDefinitelyUnsentDraft
+  // uses: restored text first, newer typing after, no duplication when they
+  // already match.
+  restoreComposer: (sessionId, text) => {
+    const current =
+      state.route.sessionId === sessionId && state.shell?.composer.field
+        ? state.shell.composer.field.value
+        : draftFor(sessionId);
+    const combined =
+      current && current !== text
+        ? `${text}${text ? '\n\n' : ''}${current}`
+        : text || current;
+    saveDraft(sessionId, combined);
+    if (state.route.sessionId === sessionId && state.shell?.composer.field) {
+      state.shell.composer.field.value = combined;
+      state.shell.composer.resize();
+    }
+  },
+  // Same merge restoreDefinitelyUnsentDraft uses: without it, photos on the
+  // conflicted phone message silently vanish (and their server-side uploads
+  // leak) whenever the resolution returns the message to the composer.
+  restoreAttachments: (optimistic) => {
+    const restoredItems = restoredAttachmentItems(optimistic, null);
+    if (restoredItems.length === 0) return;
+    const currentItems = attachmentsFor(optimistic.sessionId);
+    const seen = new Set();
+    const mergedItems = [...currentItems, ...restoredItems].filter((item) => {
+      const key = item.localId || item.id;
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    state.attachmentsBySession.set(optimistic.sessionId, mergedItems);
+    optimistic.draftAttachmentItems = null;
+    persistAttachmentDrafts();
+    renderComposerAttachments();
+  },
+  persist: (options) => persistPendingDeliveries(options),
+  render: () => renderTranscript(),
+  announce,
+});
+
 function openDraftConflict(message) {
+  const act = (run) => () => {
+    closeOverlay();
+    run();
+  };
   const content = node('div', {}, [
     node('p', {
       className: 'gate-lede',
@@ -4152,29 +4275,46 @@ function openDraftConflict(message) {
     }),
     node('section', { className: 'pair-card' }, [
       node('div', { className: 'micro-caps', text: 'On your Mac' }),
-      node('p', {
-        className: 'machine-fact',
-        text: message.macDraft || 'Conductor has an unsent draft.',
-      }),
+      node('div', { className: 'draft-preview' }, [
+        node('p', {
+          className: 'machine-fact',
+          text: message.macDraft || 'Conductor has an unsent draft.',
+        }),
+      ]),
       node('div', { className: 'pair-divider' }),
       node('div', { className: 'micro-caps', text: 'From this phone' }),
-      node('p', { text: message.text }),
+      node('div', { className: 'draft-preview' }, [
+        node('p', { text: message.text }),
+      ]),
     ]),
     node('button', {
       className: 'primary-button',
       type: 'button',
-      text: 'Replace and send',
+      text: 'Replace and send mine',
       on: {
-        click: () => {
-          message.delivery = 'delivering';
-          void persistPendingDeliveries();
-          closeOverlay();
-          renderTranscript();
-          deliverOptimistic(message, {
-            replaceDraft: true,
-            expectedMacDraft: message.macDraft,
-          });
-        },
+        click: act(() => {
+          void draftConflictFlow.replaceAndSend(message);
+        }),
+      },
+    }),
+    node('button', {
+      className: 'secondary-button',
+      type: 'button',
+      text: 'Send the Mac draft, then mine',
+      on: {
+        click: act(() => {
+          void draftConflictFlow.sendMacDraft(message, { thenPhone: true });
+        }),
+      },
+    }),
+    node('button', {
+      className: 'secondary-button',
+      type: 'button',
+      text: 'Send only the Mac draft',
+      on: {
+        click: act(() => {
+          void draftConflictFlow.sendMacDraft(message);
+        }),
       },
     }),
     node('button', {
@@ -4182,14 +4322,9 @@ function openDraftConflict(message) {
       type: 'button',
       text: 'Keep the Mac draft',
       on: {
-        click: () => {
-          state.shell.composer.field.value = message.text;
-          saveDraft(message.sessionId, message.text);
-          state.optimistic = state.optimistic.filter((item) => item !== message);
-          void persistPendingDeliveries();
-          closeOverlay();
-          renderTranscript();
-        },
+        click: act(() => {
+          draftConflictFlow.keepMacDraft(message);
+        }),
       },
     }),
   ]);
@@ -4276,6 +4411,28 @@ function startEvents() {
       if (state.unreadHeadsLoaded) invalidateUnreadHeadEvidence();
       state.connection = state.lastHeartbeat ? 'offline' : 'connecting';
       renderConnectionState();
+      // Losing the stream used to be reported and then left alone: EventSource
+      // does not reliably reopen one that iOS tore down, and startEvents is
+      // otherwise only reached from revealApplication. That is why a stale app
+      // recovered only after being backgrounded and foregrounded. Rebuild here.
+      //
+      // Gated on a heartbeat having arrived at least once, so a first load that
+      // has not connected yet is left to its original attempt rather than being
+      // restarted out from under itself.
+      if (
+        state.lastHeartbeat &&
+        !document.hidden &&
+        state.auth &&
+        state.shell &&
+        Date.now() - (state.lastStreamRevive || 0) > STREAM_REVIVE_MS
+      ) {
+        state.lastStreamRevive = Date.now();
+        // startEvents clears this interval through stopEvents and installs a
+        // fresh one, so nothing below may touch timer state.
+        startEvents();
+        transcriptRefresh.schedule();
+        metadataRefresh.schedule();
+      }
     }
   }, 1_000);
   state.activityTimer = setInterval(() => {
@@ -4295,6 +4452,15 @@ function startEvents() {
       }
     });
   }, ACTIVITY_HEARTBEAT_MS);
+  // Only while on screen, so a backgrounded phone costs nothing. The refresh
+  // coordinators debounce and drop duplicates against an in-flight request, so
+  // this cannot stack up behind a slow response or race the stream's own
+  // refresh: whichever arrives first wins and the other is dropped.
+  state.backstopTimer = setInterval(() => {
+    if (document.hidden || !state.auth || !state.shell) return;
+    transcriptRefresh.schedule();
+    metadataRefresh.schedule();
+  }, TRANSCRIPT_BACKSTOP_MS);
 }
 
 function stopEvents() {
@@ -4304,8 +4470,12 @@ function stopEvents() {
   metadataRefresh.stop();
   if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
   if (state.activityTimer) clearInterval(state.activityTimer);
+  // Cleared with the rest. startEvents calls stopEvents first, so leaking this
+  // would start a second backstop on every stream revive.
+  if (state.backstopTimer) clearInterval(state.backstopTimer);
   state.heartbeatTimer = null;
   state.activityTimer = null;
+  state.backstopTimer = null;
 }
 
 function renderConnectionState() {
@@ -4879,6 +5049,15 @@ document.addEventListener('visibilitychange', () => {
     return;
   }
   if (!appUpdateCoordinator?.foreground()) revealApplication();
+  // Pending deliveries were only reconciled at boot, so a send whose response
+  // was lost while the phone was pocketed stayed at "Delivering" until a full
+  // restart. checkDelivery is a status probe, never a resend, so this is safe
+  // to run on every return to the foreground.
+  void recoverPendingDeliveries();
+});
+
+window.addEventListener('online', () => {
+  void recoverPendingDeliveries();
 });
 
 window.addEventListener('pagehide', shieldApplication);

@@ -1274,6 +1274,13 @@ export function createPocketServer({
                         ? sendResult.composerOwned
                         : null,
                     elapsedMs: Date.now() - sendStartedAt,
+                    // The underlying osascript failure text, when the
+                    // transport preserved one. Without it every automation
+                    // failure is undiagnosable from this log.
+                    ...(typeof sendResult.detail === 'string' &&
+                    sendResult.detail !== ''
+                      ? { detail: sendResult.detail.slice(0, 500) }
+                      : {}),
                   });
                 };
                 deliveryTransportStarted = true;
