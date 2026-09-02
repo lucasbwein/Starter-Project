@@ -503,6 +503,33 @@ export function pendingDeliverySnapshotTransition(
     snapshot.messages[index] = stopped;
     return { snapshot, value: stopped };
   }
+  if (command?.type === 'dismiss-delivered-receipt') {
+    const index = snapshot.messages.findIndex(
+      (candidate) => candidate.id === command.message?.id,
+    );
+    const candidate = index >= 0 ? snapshot.messages[index] : null;
+    const verifiedReceipt = {
+      state: 'delivered',
+      messageId: command.verifiedReceipt?.messageId,
+      rowId: command.verifiedReceipt?.rowId,
+    };
+    if (
+      candidate?.delivery !== 'delivered' ||
+      !deliveryIdentityMatches(candidate, command.message) ||
+      candidate.receiptRowId !== command.message?.receiptRowId ||
+      candidate.receiptMessageId !== command.message?.receiptMessageId ||
+      candidate.receiptObservedAt !== command.message?.receiptObservedAt ||
+      !sameDeliveredReceiptIdentity(candidate, verifiedReceipt)
+    ) {
+      return { snapshot, value: null };
+    }
+    snapshot.messages.splice(index, 1);
+    addTerminalTombstone(snapshot, candidate, 'resolved', now);
+    snapshot.draftClaims = snapshot.draftClaims.filter(
+      (claim) => !draftClaimOwnsMessage(claim, candidate),
+    );
+    return { snapshot, value: candidate };
+  }
   if (command?.type === 'expire-receipt') {
     const index = snapshot.messages.findIndex(
       (candidate) => candidate.id === command.message?.id,
@@ -989,6 +1016,92 @@ export function receiptTranscriptDisposition(
     return 'before-window';
   }
   return 'unresolved';
+}
+
+export function sameDeliveredReceiptIdentity(message, delivery) {
+  if (
+    message?.delivery !== 'delivered' ||
+    delivery?.state !== 'delivered'
+  ) {
+    return false;
+  }
+  const messageRowId = Number(message.receiptRowId);
+  const deliveryRowId = Number(delivery.rowId);
+  if (
+    !Number.isSafeInteger(messageRowId) ||
+    messageRowId <= 0 ||
+    deliveryRowId !== messageRowId
+  ) {
+    return false;
+  }
+  const messageId = authorityString(message.receiptMessageId, 500);
+  const deliveryMessageId = authorityString(delivery.messageId, 500);
+  return messageId || deliveryMessageId
+    ? messageId === deliveryMessageId
+    : true;
+}
+
+export function missingDeliveredReceiptDisposition(message, delivery) {
+  if (sameDeliveredReceiptIdentity(message, delivery)) {
+    return 'resume-observation';
+  }
+  if (delivery?.state === 'delivered') return 'identity-mismatch';
+  if (deliveryStatusIsTerminal(delivery)) return 'settle-terminal';
+  return 'wait';
+}
+
+export function deliveredReceiptVerificationDelay(
+  message,
+  now,
+  stallMs,
+) {
+  const deliveredAt = Date.parse(message?.deliveredAt || '');
+  const checkedAt = Number(now);
+  const delay = Number(stallMs);
+  if (
+    !Number.isFinite(deliveredAt) ||
+    !Number.isFinite(checkedAt) ||
+    !Number.isFinite(delay) ||
+    delay < 0
+  ) {
+    return 0;
+  }
+  return Math.max(0, deliveredAt + delay - checkedAt);
+}
+
+export function deliveryReceiptObservationDisposition(
+  message,
+  delivery,
+  now,
+  deadline,
+) {
+  const checkedAt = Number(now);
+  const stopAt = Number(deadline);
+  if (!Number.isFinite(checkedAt) || !Number.isFinite(stopAt)) {
+    return 'stop';
+  }
+  if (checkedAt < stopAt) return 'wait';
+  return sameDeliveredReceiptIdentity(message, delivery)
+    ? 'expire'
+    : 'stop';
+}
+
+export function deliveredReceiptCanDismiss(message, now, minimumAgeMs) {
+  if (message?.delivery !== 'delivered') return false;
+  const checkedAt = Number(now);
+  const minimumAge = Number(minimumAgeMs);
+  if (
+    !Number.isFinite(checkedAt) ||
+    !Number.isFinite(minimumAge) ||
+    minimumAge < 0
+  ) {
+    return false;
+  }
+  const deliveredAt = Date.parse(
+    message.deliveredAt || message.createdAt || '',
+  );
+  return !Number.isFinite(deliveredAt) ||
+    checkedAt >= deliveredAt + minimumAge;
 }
 
 export function reconcileDeliveryReceipts(

@@ -5,14 +5,19 @@ import * as deliveryReceipts from '../public/delivery-receipts.js';
 import {
   createDeliveryActionCoordinator,
   deliveryNeedsAutomaticRecovery,
+  deliveredReceiptCanDismiss,
+  deliveredReceiptVerificationDelay,
+  deliveryReceiptObservationDisposition,
   deliveryRecoveryDecision,
   deliveryStatusIsTerminal,
   extendDeliveryRecoveryDeadline,
+  missingDeliveredReceiptDisposition,
   readDeliveryStatusResponse,
   rearmDeliveryRecovery,
   receiptReachedTranscript,
   reconcileDeliveryReceipts,
   runDefinitelyUnsentRetry,
+  sameDeliveredReceiptIdentity,
   terminalDeliveryActionDisposition,
 } from '../public/delivery-receipts.js';
 
@@ -1466,6 +1471,256 @@ test('a delivered receipt is tracked while its transcript row has not appeared',
   assert.deepEqual(result.reconciled, []);
   assert.deepEqual(result.missing, []);
   assert.deepEqual(result.unreconciled, [message]);
+});
+
+test('an existing delivered receipt keeps one observation clock across refreshes', async () => {
+  const observed = persistedMessage({
+    delivery: 'delivered',
+    retrySafe: false,
+    definitelyUnsent: false,
+    receiptMessageId: 'server-user-12',
+    receiptRowId: 12,
+    receiptObservedAt: 1_777_777_777_000,
+    deliveredAt: '2026-05-02T00:00:00.000Z',
+  });
+  const sameStatus = {
+    state: 'delivered',
+    messageId: observed.receiptMessageId,
+    rowId: observed.receiptRowId,
+  };
+
+  assert.equal(sameDeliveredReceiptIdentity(observed, sameStatus), true);
+  assert.equal(
+    missingDeliveredReceiptDisposition(observed, sameStatus),
+    'resume-observation',
+  );
+  assert.equal(
+    missingDeliveredReceiptDisposition(observed, {
+      ...sameStatus,
+      rowId: 13,
+    }),
+    'identity-mismatch',
+  );
+  assert.equal(
+    missingDeliveredReceiptDisposition(observed, {
+      state: 'failed',
+      final: true,
+      code: 'conductor_message_cancelled',
+    }),
+    'settle-terminal',
+  );
+  assert.equal(
+    missingDeliveredReceiptDisposition(observed, { state: 'pending' }),
+    'wait',
+  );
+  assert.equal(
+    sameDeliveredReceiptIdentity(observed, {
+      ...sameStatus,
+      rowId: 13,
+    }),
+    false,
+  );
+  assert.equal(
+    sameDeliveredReceiptIdentity(observed, {
+      ...sameStatus,
+      messageId: 'different-user-12',
+    }),
+    false,
+  );
+
+  const js = await fs.readFile(
+    new URL('../public/app.js', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    js,
+    /for \(const message of result\.unreconciled\) \{[\s\S]*observeDeliveredReceipt\(message\)[\s\S]*verifyStalledDeliveredReceipt\(message\)/,
+  );
+  const missingStart = js.indexOf('async function verifyMissingDeliveryReceipt');
+  const missingEnd = js.indexOf('async function verifyStalledDeliveredReceipt');
+  const missingVerifier = js.slice(missingStart, missingEnd);
+  assert.match(
+    missingVerifier,
+    /missingDeliveredReceiptDisposition\([\s\S]*message,[\s\S]*delivery,[\s\S]*\)/,
+  );
+  assert.match(
+    missingVerifier,
+    /if \(disposition === 'resume-observation'\) \{[\s\S]*return;[\s\S]*\}\s*if \(disposition !== 'settle-terminal'\) return;/,
+  );
+});
+
+test('receipt observation stops at its deadline instead of polling without delay', () => {
+  const message = persistedMessage({
+    delivery: 'delivered',
+    receiptMessageId: 'server-user-12',
+    receiptRowId: 12,
+  });
+  assert.equal(
+    deliveryReceiptObservationDisposition(
+      message,
+      { state: 'absent' },
+      20_000,
+      20_000,
+    ),
+    'stop',
+  );
+  assert.equal(
+    deliveryReceiptObservationDisposition(
+      message,
+      { state: 'unknown' },
+      19_999,
+      20_000,
+    ),
+    'wait',
+  );
+  assert.equal(
+    deliveryReceiptObservationDisposition(
+      message,
+      {
+        state: 'delivered',
+        messageId: message.receiptMessageId,
+        rowId: message.receiptRowId,
+      },
+      20_000,
+      20_000,
+    ),
+    'expire',
+  );
+  assert.equal(
+    deliveryReceiptObservationDisposition(
+      message,
+      {
+        state: 'delivered',
+        messageId: message.receiptMessageId,
+        rowId: message.receiptRowId,
+      },
+      19_999,
+      20_000,
+    ),
+    'wait',
+  );
+  assert.equal(
+    deliveryReceiptObservationDisposition(
+      message,
+      {
+        state: 'delivered',
+        messageId: 'different-user-13',
+        rowId: 13,
+      },
+      20_000,
+      20_000,
+    ),
+    'stop',
+  );
+});
+
+test('legacy delivered receipts verify immediately and can be dismissed safely', () => {
+  const legacy = persistedMessage({
+    delivery: 'delivered',
+    retrySafe: false,
+    definitelyUnsent: false,
+    deliveredAt: null,
+    receiptMessageId: 'server-user-12',
+    receiptRowId: 12,
+    receiptObservedAt: null,
+  });
+  assert.equal(
+    deliveredReceiptVerificationDelay(legacy, 1_000_000, 30_000),
+    0,
+  );
+  assert.equal(
+    deliveredReceiptCanDismiss(
+      legacy,
+      Date.parse(legacy.createdAt) + 60_000,
+      60_000,
+    ),
+    true,
+  );
+
+  const unverified = deliveryReceipts.pendingDeliverySnapshotTransition(
+    { messages: [legacy] },
+    { type: 'dismiss-delivered-receipt', message: legacy },
+    { sanitize: acceptPersistedMessage, now: 1_000_000 },
+  );
+  assert.equal(unverified.value, null);
+  assert.deepEqual(unverified.snapshot.messages, [legacy]);
+
+  const dismissed = deliveryReceipts.pendingDeliverySnapshotTransition(
+    { messages: [legacy] },
+    {
+      type: 'dismiss-delivered-receipt',
+      message: legacy,
+      verifiedReceipt: {
+        messageId: legacy.receiptMessageId,
+        rowId: legacy.receiptRowId,
+      },
+    },
+    { sanitize: acceptPersistedMessage, now: 1_000_000 },
+  );
+  assert.equal(dismissed.value?.id, legacy.id);
+  assert.deepEqual(dismissed.snapshot.messages, []);
+  assert.equal(dismissed.snapshot.tombstones.length, 1);
+
+  const staleWriter = deliveryReceipts.pendingDeliverySnapshotTransition(
+    dismissed.snapshot,
+    { type: 'mutate', upserts: [legacy] },
+    { sanitize: acceptPersistedMessage, now: 1_000_001 },
+  );
+  assert.deepEqual(staleWriter.snapshot.messages, []);
+
+  const mismatchedProof = deliveryReceipts.pendingDeliverySnapshotTransition(
+    { messages: [legacy] },
+    {
+      type: 'dismiss-delivered-receipt',
+      message: legacy,
+      verifiedReceipt: {
+        messageId: 'different-user-13',
+        rowId: 13,
+      },
+    },
+    { sanitize: acceptPersistedMessage, now: 1_000_000 },
+  );
+  assert.equal(mismatchedProof.value, null);
+  assert.deepEqual(mismatchedProof.snapshot.messages, [legacy]);
+
+  const changedIdentity = {
+    ...legacy,
+    activeDeliveryKey: 'different-delivery-key-123456789',
+  };
+  const rejected = deliveryReceipts.pendingDeliverySnapshotTransition(
+    { messages: [legacy] },
+    { type: 'dismiss-delivered-receipt', message: changedIdentity },
+    { sanitize: acceptPersistedMessage, now: 1_000_000 },
+  );
+  assert.equal(rejected.value, null);
+  assert.deepEqual(rejected.snapshot.messages, [legacy]);
+
+  const newerReceipt = {
+    ...legacy,
+    receiptMessageId: 'server-user-13',
+    receiptRowId: 13,
+    receiptObservedAt: 1_000_000,
+  };
+  const staleReceipt = deliveryReceipts.pendingDeliverySnapshotTransition(
+    { messages: [newerReceipt] },
+    { type: 'dismiss-delivered-receipt', message: legacy },
+    { sanitize: acceptPersistedMessage, now: 1_000_001 },
+  );
+  assert.equal(staleReceipt.value, null);
+  assert.deepEqual(staleReceipt.snapshot.messages, [newerReceipt]);
+
+  return fs.readFile(
+    new URL('../public/app.js', import.meta.url),
+    'utf8',
+  ).then((js) => {
+    const start = js.indexOf('async function dismissDeliveredReceipt');
+    const end = js.indexOf('async function stopCheckingDelivery');
+    const dismiss = js.slice(start, end);
+    assert.match(
+      dismiss,
+      /requestDeliveryStatus\(message\)[\s\S]*sameDeliveredReceiptIdentity\(message, delivery\)[\s\S]*type: 'dismiss-delivered-receipt'/,
+    );
+  });
 });
 
 test('server-verified stalled receipt observation cannot erase a transcript observation or cancellation', () => {

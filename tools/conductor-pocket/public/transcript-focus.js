@@ -111,6 +111,7 @@ export function transcriptMessageRenderIdentity(
     resolvedState = null,
     newestRootEventRowId = 0,
     deliveryAction = null,
+    deliveredReceiptDismissible = false,
   } = {},
 ) {
   const rowId = Number(message?.rowId);
@@ -153,6 +154,7 @@ export function transcriptMessageRenderIdentity(
     message?.occurrenceCount,
     superseded,
     deliveryAction,
+    deliveredReceiptDismissible,
   ]);
 }
 
