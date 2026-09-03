@@ -25,18 +25,22 @@ import {
   sameDeliveredReceiptIdentity,
   terminalDeliveryActionDisposition,
   workspaceProjectCollapsedCopy,
-} from './delivery-receipts.js?v=0.2.0-storage-unstick-20260901';
+} from './delivery-receipts.js?v=0.2.0-mac-off-diagnosis-20260903';
 import {
   appUpdateReloadIsSafe,
   createAppUpdateCoordinator,
   createServiceWorkerRegistrationGetter,
-} from './app-update.js?v=0.2.0-storage-unstick-20260901';
+} from './app-update.js?v=0.2.0-mac-off-diagnosis-20260903';
 import {
   BOOTSTRAP_REQUEST_MS,
   createBootstrapCoordinator,
-} from './bootstrap-recovery.js?v=0.2.0-storage-unstick-20260901';
-import { createDraftConflictFlow } from './draft-conflict.js?v=0.2.0-storage-unstick-20260901';
-import { fetchJson } from './http.js?v=0.2.0-storage-unstick-20260901';
+} from './bootstrap-recovery.js?v=0.2.0-mac-off-diagnosis-20260903';
+import { createDraftConflictFlow } from './draft-conflict.js?v=0.2.0-mac-off-diagnosis-20260903';
+import {
+  CONNECTION_REACHED_KEY,
+  diagnoseConnection,
+} from './connection-diagnosis.js?v=0.2.0-mac-off-diagnosis-20260903';
+import { fetchJson } from './http.js?v=0.2.0-mac-off-diagnosis-20260903';
 import {
   attachmentMessageByteLength,
   imageErrorCopy,
@@ -46,16 +50,16 @@ import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   MAX_ATTACHMENT_MESSAGE_BYTES,
   prepareImageForUpload,
-} from './image-attachments.js?v=0.2.0-storage-unstick-20260901';
+} from './image-attachments.js?v=0.2.0-mac-off-diagnosis-20260903';
 import {
   applyConnectionAvailability,
   createLiveRefreshCoordinator,
   createSessionMessageRequestCoordinator,
-} from './live-refresh.js?v=0.2.0-storage-unstick-20260901';
+} from './live-refresh.js?v=0.2.0-mac-off-diagnosis-20260903';
 import {
   renderRichText,
   richTextProfile,
-} from './rich-text.js?v=0.2.0-storage-unstick-20260901';
+} from './rich-text.js?v=0.2.0-mac-off-diagnosis-20260903';
 import {
   READ_DWELL_MS,
   advanceReadProgress,
@@ -66,7 +70,7 @@ import {
   normalizeUnreadHeads,
   readableResponseRange,
   readReceiptSnapshot,
-} from './read-state.js?v=0.2.0-storage-unstick-20260901';
+} from './read-state.js?v=0.2.0-mac-off-diagnosis-20260903';
 import {
   activityLabel,
   buildFocusedTranscript,
@@ -82,15 +86,15 @@ import {
   transcriptRefreshShouldWait,
   visibleQueuedRowIds,
   visibleQueuedRowRefreshKey,
-} from './transcript-focus.js?v=0.2.0-storage-unstick-20260901';
+} from './transcript-focus.js?v=0.2.0-mac-off-diagnosis-20260903';
 import {
   isRecentChatsSwipe,
-} from './swipe-navigation.js?v=0.2.0-storage-unstick-20260901';
+} from './swipe-navigation.js?v=0.2.0-mac-off-diagnosis-20260903';
 import {
   activeGptUsage,
   createUsageReader,
   usageAccountStatus,
-} from './usage-state.js?v=0.2.0-storage-unstick-20260901';
+} from './usage-state.js?v=0.2.0-mac-off-diagnosis-20260903';
 
 const app = document.querySelector('#app');
 const overlayRoot = document.querySelector('#overlay-root');
@@ -151,7 +155,7 @@ const DELIVERY_RECEIPT_DISMISS_MS = 60_000;
 const MAX_CONCURRENT_DELIVERY_RECOVERIES = 2;
 const DELIVERY_POST_TIMEOUT_MS = 90_000;
 const TAILSCALE_SESSION_MODE = 'tailscale-session';
-const CLIENT_SHELL_REVISION = '0.2.0-storage-unstick-20260901';
+const CLIENT_SHELL_REVISION = '0.2.0-mac-off-diagnosis-20260903';
 const MAX_CONCURRENT_IMAGE_UPLOADS = 2;
 const IMAGE_UPLOAD_TIMEOUT_MS = 45_000;
 const MOTION_MS = Object.freeze({
@@ -166,6 +170,9 @@ const state = {
   connection: 'connecting',
   lastHeartbeat: 0,
   connectionProbe: null,
+  // The error behind the current failure, so the gate can say WHY the Mac is
+  // unreachable instead of only that it is. Cleared on every success.
+  connectionError: null,
   eventSource: null,
   initialStreamTimer: null,
   heartbeatTimer: null,
@@ -1088,6 +1095,7 @@ function bootstrap() {
     onSuccess: async (auth) => {
       state.auth = auth;
       state.csrfToken = auth.csrfToken;
+      recordConnectionReached();
       if (auth.unlocked) await startApplication();
       else renderLock();
     },
@@ -1095,6 +1103,7 @@ function bootstrap() {
       if (error.status === 401 || error.code === 'device_revoked') {
         await purgeThenRenderSignedOut();
       } else {
+        state.connectionError = error;
         renderConnectionGate(error.code);
       }
     },
@@ -1258,6 +1267,38 @@ async function purgeThenRenderSignedOut() {
   }
 }
 
+// A cold launch forgets state.lastHeartbeat, and a cold launch is exactly when
+// "when did this last work" is the useful fact, so reachability is persisted.
+// Written at most once a minute because live() fires on every 5s heartbeat.
+function recordConnectionReached(now = Date.now()) {
+  state.connectionError = null;
+  try {
+    const previous = Number(localStorage.getItem(CONNECTION_REACHED_KEY));
+    if (Number.isFinite(previous) && now - previous < 60_000) return;
+    localStorage.setItem(CONNECTION_REACHED_KEY, String(now));
+  } catch {
+    // A blocked or full store costs only the "last reached" sentence.
+  }
+}
+
+function lastConnectionReachedAt() {
+  try {
+    const stored = Number(localStorage.getItem(CONNECTION_REACHED_KEY));
+    if (Number.isFinite(stored) && stored > 0) return stored;
+  } catch {
+    // Fall through to whatever this session has seen.
+  }
+  return state.lastHeartbeat || null;
+}
+
+function connectionDiagnosis(error = state.connectionError) {
+  return diagnoseConnection({
+    error,
+    online: navigator.onLine !== false,
+    lastReachedAt: lastConnectionReachedAt(),
+  });
+}
+
 function renderConnectionGate(code) {
   const upgradeRequired = code === 'retirement_client_upgrade_required';
   const identityProblem =
@@ -1265,20 +1306,24 @@ function renderConnectionGate(code) {
     code === 'tailscale_identity_denied' ||
     code === 'tailscale_identity_unpaired' ||
     code === 'device_identity_mismatch';
+  // The failure that produced this code, when it is the same failure. A stale
+  // error from an earlier problem must not narrate the current one, so the two
+  // have to agree on the code before the richer object is trusted.
+  const failure =
+    state.connectionError &&
+    (state.connectionError.code || null) === (code || null)
+      ? state.connectionError
+      : code;
+  const verdict = connectionDiagnosis(failure);
   gateView({
     connectionAnchor: !upgradeRequired && !identityProblem,
     mark: upgradeRequired ? 'refresh' : 'wifiOff',
-    title: upgradeRequired ? 'Pocket must refresh' : 'Mac unreachable',
-    body:
-      upgradeRequired
-        ? 'Fully close Pocket, reopen it while online, then sign out again. The old app cannot retire this phone.'
-        : identityProblem
-        ? 'Connect this phone with the paired Tailscale account, then try again.'
-        : 'Conductor Pocket could not reach the relay on your Mac.',
+    title: verdict.title,
+    body: verdict.body,
     action: node('button', {
       className: 'primary-button',
       type: 'button',
-      text: upgradeRequired ? 'Reload Pocket' : 'Try again',
+      text: verdict.retryLabel,
       on: {
         click: () => {
           if (upgradeRequired) location.reload();
@@ -3978,7 +4023,13 @@ function sessionLocationLabel(session) {
 function connectionVoice() {
   if (state.connection === 'live') return { text: 'Live', className: '', dot: 'live' };
   if (state.connection === 'offline') {
-    return { text: 'Mac unreachable', className: 'down', iconName: 'wifiOff' };
+    // Short enough for the chip. A phone with no network is the one cause that
+    // is knowable without making a request, and it is not the Mac's fault.
+    return {
+      text: navigator.onLine === false ? 'Phone offline' : 'Mac unreachable',
+      className: 'down',
+      iconName: 'wifiOff',
+    };
   }
   return { text: 'Reconnecting…', className: 'wait', iconName: 'refresh' };
 }
@@ -5198,15 +5249,24 @@ function messageRenderKey(message, toolResults) {
   });
 }
 
+function offlineBannerCopy() {
+  if (navigator.onLine === false) return 'This phone is offline';
+  if (state.connectionError) return connectionDiagnosis().title;
+  return state.lastHeartbeat
+    ? `Mac unreachable · Last synced ${formatTime(state.lastHeartbeat)}`
+    : 'Mac unreachable';
+}
+
 function renderBanner(container) {
   const down = state.connection === 'offline';
+  // Losing the event stream only proves the stream stopped, so the banner must
+  // not invent a cause. It upgrades its copy on the two things it can actually
+  // prove: this phone having no network, and a request that really did fail.
   const copy =
     state.connection === 'live'
       ? ''
       : down
-        ? state.lastHeartbeat
-          ? `Mac unreachable · Last synced ${formatTime(state.lastHeartbeat)}`
-          : 'Mac unreachable'
+        ? offlineBannerCopy()
         : 'Reconnecting…';
   const renderKey = JSON.stringify([state.connection, copy]);
   if (container.dataset.renderKey === renderKey) return false;
@@ -7333,6 +7393,7 @@ function startEventsAttempt({ initialRetry = false } = {}) {
       state.initialStreamTimer = null;
     }
     state.lastHeartbeat = Date.now();
+    recordConnectionReached(state.lastHeartbeat);
     if (state.connection !== 'live') {
       state.connection = 'live';
       renderConnectionState();
@@ -8439,6 +8500,7 @@ async function runConnectionCheck(content) {
   try {
     const probe = await request('/api/connection?force=1');
     state.connectionProbe = probe;
+    recordConnectionReached();
     applyAppConnectionAvailability('live');
     const latency = Math.round(performance.now() - startedAt);
     const rows = [
@@ -8466,12 +8528,16 @@ async function runConnectionCheck(content) {
     void appendAccountUsage(content, { force: true });
     renderComposerState();
   } catch (error) {
+    state.connectionError = error;
     applyAppConnectionAvailability('offline');
+    // This sheet just made a real request, so unlike the passive banner it has
+    // first hand evidence of what failed and can name it.
+    const verdict = connectionDiagnosis(error);
     content.replaceChildren(
       node('div', { className: 'empty-state' }, [
         icon('warn'),
-        node('h2', { text: 'The relay check failed' }),
-        node('p', { text: 'Confirm Tailscale and the relay are running on your Mac.' }),
+        node('h2', { text: verdict.title }),
+        node('p', { text: verdict.body }),
       ]),
     );
   }
@@ -8853,6 +8919,7 @@ async function revealApplication() {
         ) {
           handleRuntimeError(error);
         } else {
+          state.connectionError = error;
           renderConnectionGate(error.code);
         }
       }

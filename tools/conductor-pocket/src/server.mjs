@@ -97,6 +97,10 @@ const staticFiles = new Map([
     ['draft-conflict.js', 'text/javascript; charset=utf-8'],
   ],
   ['/usage-state.js', ['usage-state.js', 'text/javascript; charset=utf-8']],
+  [
+    '/connection-diagnosis.js',
+    ['connection-diagnosis.js', 'text/javascript; charset=utf-8'],
+  ],
   ['/app-update.js', ['app-update.js', 'text/javascript; charset=utf-8']],
   ['/http.js', ['http.js', 'text/javascript; charset=utf-8']],
   [
