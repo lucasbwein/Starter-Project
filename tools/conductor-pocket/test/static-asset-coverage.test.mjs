@@ -98,3 +98,32 @@ test('usage state ships as a revisioned checked shell module', async () => {
     'package check must syntax-check the usage state module',
   );
 });
+
+test('connection diagnosis ships as a revisioned checked shell module', async () => {
+  const revision = swSource.match(
+    /const SHELL_REVISION = '([^']+)'/,
+  )?.[1];
+  assert.ok(revision);
+  assert.ok(
+    swSource.includes(`'/connection-diagnosis.js?v=${revision}'`),
+    'service worker shell must cache the revisioned diagnosis module',
+  );
+  assert.ok(
+    indexSource.includes(
+      `rel="modulepreload" href="/connection-diagnosis.js?v=${revision}"`,
+    ),
+    'index must preload the matching diagnosis revision',
+  );
+  assert.ok(
+    serverSource.includes("'/connection-diagnosis.js'"),
+    'server allowlist must serve the diagnosis module',
+  );
+  const packageSource = await fs.readFile(
+    new URL('../package.json', import.meta.url),
+    'utf8',
+  );
+  assert.ok(
+    packageSource.includes('node --check public/connection-diagnosis.js'),
+    'package check must syntax-check the diagnosis module',
+  );
+});
